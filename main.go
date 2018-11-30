@@ -41,6 +41,9 @@ Options:
   -datadir DIR  base directory where listing files will be written
   -keep         keep content of bad files when creating listing
   -meta         create XML metadata file next to listing files
+  -zero         use nul byte to fill buffer instead of 0x20
+  -list         print the list of blocks
+  -report       print a report on available blocks
   -version      print version and exit
   -help         print this text and exit
 
@@ -66,11 +69,22 @@ func init() {
 	}
 }
 
+type coze struct {
+	Size    int
+	Count   int
+	Missing int
+	Name    string
+}
+
 func main() {
-	datadir := flag.String("datadir", os.TempDir(), "")
+	datadir := flag.String("datadir", "-", "")
 	version := flag.Bool("version", false, "")
 	keep := flag.Bool("keep", false, "")
+	// uniq := flag.Bool("one", false, "")
 	meta := flag.Bool("meta", false, "")
+	zero := flag.Bool("bin", false, "")
+	list := flag.Bool("list", false, "")
+	report := flag.Bool("report", false, "")
 	flag.Parse()
 	if *version {
 		fmt.Fprintf(os.Stderr, "%s-%s (%s)\n", Program, Version, BuildTime)
@@ -86,11 +100,22 @@ func main() {
 			log.Fatalln(err)
 		}
 	}
+
 	r, err := NewReader(ps, *keep)
 	if err != nil {
 		log.Fatalln(err)
 	}
-	buffer, err := prepare(r)
+	if *list || *report {
+		if err := listBlocks(r, *list && !*report); err != nil {
+			log.Fatalln(err)
+		}
+		return
+	}
+	var filler byte
+	if !*zero {
+		filler = byte(0x20)
+	}
+	buffer, err := prepare(r, filler)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -112,6 +137,45 @@ func main() {
 			}
 		}
 	}
+}
+
+func listBlocks(r io.Reader, list bool) error {
+	var (
+		prev    uint16
+		missing int
+		count   int
+		size    int
+	)
+	for {
+		body := make([]byte, LineSize)
+		if n, err := io.ReadFull(r, body); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		} else {
+			size += n
+			count++
+		}
+		s := binary.BigEndian.Uint16(body)
+		if s == FileFlag {
+			size := binary.BigEndian.Uint32(body[2:])
+			name := string(bytes.Trim(body[6:], "\x00"))
+			if list {
+				fmt.Printf("%s (%d bytes)\n", name, size)
+			}
+			continue
+		}
+		if diff := (s - prev) - 1; diff != s && diff > 1 && diff < 32<<10 {
+			missing += int(diff)
+		}
+		prev = s
+		if list {
+			fmt.Printf("%5d (%04x): %x\n", s, body[:2], body[2:])
+		}
+	}
+	fmt.Printf("%d blocks (%d missing), %dKB\n", count, missing, size>>10)
+	return nil
 }
 
 type block struct {
@@ -202,7 +266,7 @@ func (m mvis) writeBlock(bs []byte) {
 	}
 }
 
-func prepare(r io.Reader) (map[string]*mvis, error) {
+func prepare(r io.Reader, filler byte) (map[string]*mvis, error) {
 	buffer := make(map[string]*mvis)
 	var name string
 	for {
@@ -227,7 +291,7 @@ func prepare(r io.Reader) (map[string]*mvis, error) {
 					Payload: make([]byte, int(size)),
 				}
 				for i := 0; i < int(size); i++ {
-					m.Payload[i] = byte(0x20)
+					m.Payload[i] = filler
 				}
 				buffer[name] = &m
 			}
