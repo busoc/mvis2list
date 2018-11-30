@@ -111,32 +111,39 @@ func main() {
 		}
 		return
 	}
+	if err := dumpFiles(r, *datadir, *zero, *meta); err != nil {
+		log.Fatalln(err)
+	}
+}
+
+func dumpFiles(r *fileReader, datadir string, zero, meta bool) error {
 	var filler byte
-	if !*zero {
+	if !zero {
 		filler = byte(0x20)
 	}
 	buffer, err := prepare(r, filler)
 	if err != nil {
-		log.Fatalln(err)
+		return err
 	}
-	if *datadir == "-" {
+	if datadir == "-" {
 		for _, m := range buffer {
 			if _, err := io.Copy(os.Stdout, bytes.NewReader(m.Payload)); err != nil {
-				log.Fatalln(err)
+				return err
 			}
 		}
-	} else {
-		for _, m := range buffer {
-			if err := m.WriteFile(*datadir); err != nil {
-				log.Fatalln(err)
-			}
-			if *meta {
-				if err := m.WriteMetadata(*datadir); err != nil {
-					log.Fatalln(err)
-				}
+		return nil
+	}
+	for _, m := range buffer {
+		if err := m.WriteFile(datadir); err != nil {
+			return err
+		}
+		if meta {
+			if err := m.WriteMetadata(datadir); err != nil {
+				return err
 			}
 		}
 	}
+	return nil
 }
 
 func listBlocks(r io.Reader, list bool) error {
