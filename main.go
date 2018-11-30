@@ -3,13 +3,16 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/md5"
 	"encoding/binary"
+	"encoding/xml"
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"os"
-	// "path/filepath"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -22,14 +25,57 @@ const (
 	LineSize = 64
 )
 
-type mvis struct {
-	File    string
-	Count   int
-	Missing int
+const (
+	Program   = "mvis2list"
+	Version   = "0.1.0"
+	BuildTime = "2018-11-29 20:45:00"
+)
+
+const helpText = `mvis2list transforms MVIS data from hadock archive to MVIS
+listing files
+
+Usage: mvis2list [-datadir] [-version] [-keep] [-meta] <list of dat files>
+
+Options:
+
+  -datadir DIR  base directory where listing files will be written
+  -keep         keep content of bad files when creating listing
+  -meta         create XML metadata file next to listing files
+  -version      print version and exit
+  -help         print this text and exit
+
+Examples:
+
+# read dat files from given path and write listing files under /tmp directory
+# without creating the metadata
+$ mvis2list -datadir /tmp /var/hdk/51/2018/23/30/*dat
+
+# create the list of files to process from a find and write listing files under
+# /tmp directory with XML files next to those
+$ find /var/hdk/51/2018/*dat -type f -name *dat | mvis2list -datadir /tmp -meta
+
+# same as previous but instead of creating listing in file, write them to stdout
+# (meaning of "-" for datadir)
+$ find /var/hdk/51/2018/23/30/*dat -type f -name *dat | mvis2list -datadir -
+`
+
+func init() {
+	flag.Usage = func() {
+		fmt.Fprintln(os.Stderr, helpText)
+		os.Exit(2)
+	}
 }
 
 func main() {
+	datadir := flag.String("datadir", os.TempDir(), "")
+	version := flag.Bool("version", false, "")
+	keep := flag.Bool("keep", false, "")
+	meta := flag.Bool("meta", false, "")
 	flag.Parse()
+	if *version {
+		fmt.Fprintf(os.Stderr, "%s-%s (%s)\n", Program, Version, BuildTime)
+		os.Exit(2)
+	}
 	ps := flag.Args()
 	if len(ps) == 0 {
 		s := bufio.NewScanner(os.Stdin)
@@ -40,43 +86,157 @@ func main() {
 			log.Fatalln(err)
 		}
 	}
-	rs, err := NewReader(ps)
+	r, err := NewReader(ps, *keep)
 	if err != nil {
 		log.Fatalln(err)
 	}
-	r := bufio.NewReader(rs)
-	for {
-		body := make([]byte, LineSize)
-		for {
-			if _, err := io.ReadFull(r, body); err != nil {
+	buffer, err := prepare(r)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	if *datadir == "-" {
+		for _, m := range buffer {
+			if _, err := io.Copy(os.Stdout, bytes.NewReader(m.Payload)); err != nil {
 				log.Fatalln(err)
 			}
-			sequence := binary.BigEndian.Uint16(body)
-			if sequence == MilFlag {
-				continue
-			} else if sequence == FileFlag {
-				size := binary.BigEndian.Uint32(body[2:])
-				name := bytes.Trim(body[6:], "\x00")
-				log.Printf("%d: %s (%s)", size, name, rs.Filename())
-				break
-			} else {
-				log.Fatalf("invalid sequence %d", sequence)
-			}
 		}
-		for {
-			if bs, err := r.Peek(2); err == nil {
-				s := binary.BigEndian.Uint16(bs)
-				if s == MilFlag || s == FileFlag {
-					break
+	} else {
+		for _, m := range buffer {
+			if err := m.WriteFile(*datadir); err != nil {
+				log.Fatalln(err)
+			}
+			if *meta {
+				if err := m.WriteMetadata(*datadir); err != nil {
+					log.Fatalln(err)
 				}
 			}
-			if _, err := io.ReadFull(r, body); err != nil {
-				log.Fatalln(err)
-			}
-			sequence := binary.BigEndian.Uint16(body)
-			log.Printf("%4d (%04[1]x): %x", sequence, body[2:])
 		}
 	}
+}
+
+type block struct {
+	XMLName xml.Name `xml:"block"`
+	Counter int      `xml:"sequence,attr"`
+	Sum     string   `xml:"md5,attr"`
+}
+
+type mvis struct {
+	Name    string
+	Size    int
+	Blocks  map[int]*block
+	Payload []byte
+}
+
+func (m mvis) WriteFile(dir string) error {
+	if len(m.Payload) == 0 {
+		return nil
+	}
+	file := filepath.Join(dir, m.Name)
+	if err := os.MkdirAll(filepath.Dir(file), 0755); err != nil && !os.IsExist(err) {
+		return nil
+	}
+	return ioutil.WriteFile(file, m.Payload, 0644)
+}
+
+func (m mvis) WriteMetadata(dir string) error {
+	if len(m.Payload) == 0 {
+		return nil
+	}
+	file := filepath.Join(dir, m.Name+".xml")
+	if err := os.MkdirAll(filepath.Dir(file), 0755); err != nil && !os.IsExist(err) {
+		return nil
+	}
+	bs := struct {
+		Blocks  []block
+		Written int `xml:"blocks-written,attr"`
+		Missing int `xml:"blocks-missing,attr"`
+	}{
+		Blocks:  make([]block, len(m.Blocks)),
+		Written: len(m.Blocks),
+		Missing: (m.Size / (LineSize - 2)) - len(m.Blocks),
+	}
+	for i, b := range m.Blocks {
+		bs.Blocks[i] = *b
+	}
+	c := struct {
+		XMLName xml.Name    `xml:"mvis"`
+		Program string      `xml:"program,attr"`
+		Version string      `xml:"version,attr"`
+		Build   string      `xml:"build,attr"`
+		File    string      `xml:"filename"`
+		Sum     string      `xml:"md5"`
+		Size    int         `xml:"size"`
+		Blocks  interface{} `xml:"blocks"`
+	}{
+		Program: Program,
+		Version: Version,
+		Build:   BuildTime,
+		File:    m.Name,
+		Size:    m.Size,
+		Sum:     fmt.Sprintf("%x", md5.Sum(m.Payload)),
+		Blocks:  bs,
+	}
+	w, err := os.Create(file)
+	if err != nil {
+		return err
+	}
+
+	e := xml.NewEncoder(w)
+	e.Indent("", "  ")
+	if err := e.Encode(&c); err != nil {
+		w.Close()
+		os.Remove(file)
+		return err
+	}
+	return w.Close()
+}
+
+func (m mvis) writeBlock(bs []byte) {
+	s := binary.BigEndian.Uint16(bs)
+	i := int(s) * (LineSize - 2)
+	copy(m.Payload[i:], bs[2:])
+
+	m.Blocks[int(s)] = &block{
+		Counter: int(s),
+		Sum:     fmt.Sprintf("%x", md5.Sum(bs)),
+	}
+}
+
+func prepare(r io.Reader) (map[string]*mvis, error) {
+	buffer := make(map[string]*mvis)
+	var name string
+	for {
+		body := make([]byte, LineSize)
+		if _, err := io.ReadFull(r, body); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, err
+		}
+		sequence := binary.BigEndian.Uint16(body)
+		if sequence == FileFlag {
+			size := binary.BigEndian.Uint32(body[2:])
+			name = string(bytes.Trim(body[6:], "\x00"))
+			log.Printf("%d: %s", size, name)
+
+			if _, ok := buffer[name]; !ok {
+				m := mvis{
+					Name:    name,
+					Size:    int(size),
+					Blocks:  make(map[int]*block),
+					Payload: make([]byte, int(size)),
+				}
+				for i := 0; i < int(size); i++ {
+					m.Payload[i] = byte(0x20)
+				}
+				buffer[name] = &m
+			}
+		} else {
+			m := buffer[name]
+			m.writeBlock(body)
+		}
+	}
+	return buffer, nil
 }
 
 type fileReader struct {
@@ -84,11 +244,11 @@ type fileReader struct {
 	file *os.File
 }
 
-func NewReader(ps []string) (*fileReader, error) {
+func NewReader(ps []string, keep bool) (*fileReader, error) {
 	sort.Strings(ps)
 	var xs []string
 	for _, p := range ps {
-		if strings.HasSuffix(p, ".bad") {
+		if !keep && strings.HasSuffix(p, ".bad") {
 			continue
 		}
 		xs = append(xs, p)
@@ -118,17 +278,19 @@ func (f *fileReader) Read(bs []byte) (int, error) {
 		return 0, io.EOF
 	}
 	n, err := f.file.Read(bs)
+	if p := binary.BigEndian.Uint16(bs); err == nil && p == MilFlag {
+		return 0, nil
+	}
 	if err == io.EOF {
 		if len(f.ps) > 0 {
 			f.file.Close()
 			f.file, err = openFile(f.ps[0])
-			log.Println("openFile", f.ps[0])
 			if len(f.ps) == 1 {
 				f.ps = f.ps[:0]
 			} else {
 				f.ps = f.ps[1:]
 			}
-			return f.Read(bs)
+			return 0, nil
 		} else {
 			f.file = nil
 		}
@@ -153,55 +315,3 @@ func openFile(f string) (*os.File, error) {
 	}
 	return r, err
 }
-
-// func process(ws io.Writer, p string) error {
-// 	r, err := os.Open(p)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	defer r.Close()
-// 	magic := make([]byte, 4)
-// 	if _, err := r.Read(magic); err != nil {
-// 		return err
-// 	}
-// 	if !bytes.Equal(magic, FCC) {
-// 		return fmt.Errorf("expected magic %s (found: %s)", FCC, magic)
-// 	}
-// 	if _, err := r.Seek(12, io.SeekCurrent); err != nil {
-// 		return err
-// 	}
-// 	log.Println()
-// 	var w bytes.Buffer
-// 	for {
-// 		bs := make([]byte, LineSize)
-// 		if _, err := io.ReadFull(r, bs); err != nil {
-// 			if err == io.EOF {
-// 				break
-// 			}
-// 			return err
-// 		}
-// 		sequence := binary.BigEndian.Uint16(bs)
-// 		switch sequence {
-// 		case MilFlag:
-// 			continue
-// 		case FileFlag:
-// 			size := binary.BigEndian.Uint32(bs[2:])
-// 			name := bytes.Trim(bs[6:], "\x00")
-// 			log.Printf("%d: %s", size, name)
-// 		default:
-// 		}
-// 		log.Printf("%4d: %x", binary.BigEndian.Uint16(bs), bs)
-//
-// 		bs = bytes.Trim(bs[2:], "\x00")
-// 		for i := 0; i < len(bs); i += 2 {
-// 			w.WriteByte(bs[i])
-// 			if j := i + 1; j < len(bs) {
-// 				w.WriteByte(bs[j])
-// 			}
-// 		}
-// 	}
-// 	if w.Len() > 0 {
-// 		io.WriteString(ws, w.String())
-// 	}
-// 	return nil
-// }
