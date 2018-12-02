@@ -63,6 +63,7 @@ $ find /var/hdk/51/2018/23/30/*dat -type f -name *dat | mvis2list -datadir -
 `
 
 func init() {
+	log.SetFlags(0)
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, helpText)
 		os.Exit(2)
@@ -80,9 +81,8 @@ func main() {
 	datadir := flag.String("datadir", "-", "")
 	version := flag.Bool("version", false, "")
 	keep := flag.Bool("keep", false, "")
-	// uniq := flag.Bool("one", false, "")
 	meta := flag.Bool("meta", false, "")
-	zero := flag.Bool("bin", false, "")
+	zero := flag.Bool("zero", false, "")
 	list := flag.Bool("list", false, "")
 	report := flag.Bool("report", false, "")
 	flag.Parse()
@@ -164,10 +164,10 @@ func listBlocks(r io.Reader, list bool) error {
 			size += n
 			count++
 		}
-		s := binary.BigEndian.Uint16(body)
+		s := binary.BigEndian.Uint16(body[2:])
 		if s == FileFlag {
-			size := binary.BigEndian.Uint32(body[2:])
-			name := string(bytes.Trim(body[6:], "\x00"))
+			size := binary.BigEndian.Uint32(body[4:])
+			name := string(bytes.Trim(body[8:], "\x00"))
 			if list {
 				fmt.Printf("%s (%d bytes)\n", name, size)
 			}
@@ -178,7 +178,7 @@ func listBlocks(r io.Reader, list bool) error {
 		}
 		prev = s
 		if list {
-			fmt.Printf("%5d (%04x): %x\n", s, body[:2], body[2:])
+			fmt.Printf("%5d (%04x): %x\n", s, body[2:4], body[4:])
 		}
 	}
 	fmt.Printf("%d blocks (%d missing), %dKB\n", count, missing, size>>10)
@@ -196,6 +196,8 @@ type mvis struct {
 	Size    int
 	Blocks  map[int]*block
 	Payload []byte
+
+	offset int
 }
 
 func (m mvis) WriteFile(dir string) error {
@@ -263,9 +265,16 @@ func (m mvis) WriteMetadata(dir string) error {
 }
 
 func (m mvis) writeBlock(bs []byte) {
-	s := binary.BigEndian.Uint16(bs)
-	i := int(s) * (LineSize - 2)
-	copy(m.Payload[i:], bs[2:])
+	k := int(binary.BigEndian.Uint16(bs))
+	if m.offset == -1 {
+		m.offset = k
+	}
+	s := binary.BigEndian.Uint16(bs[2:])
+	// i := ((k-m.offset) * 32<<10) + (int(s) * (LineSize - 2))
+	i := (int(s) * (LineSize - 2))
+	copy(m.Payload[i:], bs[4:])
+
+	log.Printf("bck: %6d, k: %2d, ix: %8d,  %x", s, k, i, bs[4:])
 
 	m.Blocks[int(s)] = &block{
 		Counter: int(s),
@@ -277,17 +286,17 @@ func prepare(r io.Reader, filler byte) (map[string]*mvis, error) {
 	buffer := make(map[string]*mvis)
 	var name string
 	for {
-		body := make([]byte, LineSize)
+		body := make([]byte, LineSize+2)
 		if _, err := io.ReadFull(r, body); err != nil {
 			if err == io.EOF {
 				break
 			}
 			return nil, err
 		}
-		sequence := binary.BigEndian.Uint16(body)
+		sequence := binary.BigEndian.Uint16(body[2:])
 		if sequence == FileFlag {
-			size := binary.BigEndian.Uint32(body[2:])
-			name = string(bytes.Trim(body[6:], "\x00"))
+			size := binary.BigEndian.Uint32(body[4:])
+			name = string(bytes.Trim(body[8:], "\x00"))
 			log.Printf("%d: %s", size, name)
 
 			if _, ok := buffer[name]; !ok {
@@ -296,6 +305,7 @@ func prepare(r io.Reader, filler byte) (map[string]*mvis, error) {
 					Size:    int(size),
 					Blocks:  make(map[int]*block),
 					Payload: make([]byte, int(size)),
+					offset:  -1,
 				}
 				for i := 0; i < int(size); i++ {
 					m.Payload[i] = filler
@@ -311,8 +321,10 @@ func prepare(r io.Reader, filler byte) (map[string]*mvis, error) {
 }
 
 type fileReader struct {
-	ps   []string
-	file *os.File
+	prefix  string
+	counter uint16
+	ps      []string
+	file    *os.File
 }
 
 func NewReader(ps []string, keep bool) (*fileReader, error) {
@@ -327,7 +339,7 @@ func NewReader(ps []string, keep bool) (*fileReader, error) {
 	if len(xs) == 0 {
 		return nil, fmt.Errorf("no valid files provided")
 	}
-	f, err := openFile(xs[0])
+	f, prefix, err := openFile(xs[0])
 	if err != nil {
 		return nil, err
 	}
@@ -337,7 +349,7 @@ func NewReader(ps []string, keep bool) (*fileReader, error) {
 		xs = xs[:0]
 	}
 
-	return &fileReader{file: f, ps: xs}, nil
+	return &fileReader{file: f, ps: xs, prefix: prefix}, nil
 }
 
 func (f *fileReader) Filename() string {
@@ -348,18 +360,30 @@ func (f *fileReader) Read(bs []byte) (int, error) {
 	if len(f.ps) == 0 && f.file == nil {
 		return 0, io.EOF
 	}
-	n, err := f.file.Read(bs)
-	if p := binary.BigEndian.Uint16(bs); err == nil && p == MilFlag {
+	xs := make([]byte, LineSize+2)
+	binary.BigEndian.PutUint16(xs, f.counter)
+
+	n, err := f.file.Read(xs[2:])
+	if p := binary.BigEndian.Uint16(xs[2:]); err == nil && p == MilFlag {
 		return 0, nil
+	}
+	if err == nil && n > 0 {
+		n = copy(bs, xs)
 	}
 	if err == io.EOF {
 		if len(f.ps) > 0 {
+			var prefix string
+
 			f.file.Close()
-			f.file, err = openFile(f.ps[0])
+			f.file, prefix, err = openFile(f.ps[0])
 			if len(f.ps) == 1 {
 				f.ps = f.ps[:0]
 			} else {
 				f.ps = f.ps[1:]
+			}
+			if prefix != f.prefix {
+				f.prefix = prefix
+				f.counter++
 			}
 			return 0, nil
 		} else {
@@ -369,20 +393,26 @@ func (f *fileReader) Read(bs []byte) (int, error) {
 	return n, err
 }
 
-func openFile(f string) (*os.File, error) {
+func openFile(f string) (*os.File, string, error) {
+	var prefix string
+
 	r, err := os.Open(f)
 	if err != nil {
-		return nil, err
+		return nil, prefix, err
 	}
 	magic := make([]byte, 4)
 	if _, err := r.Read(magic); err != nil {
-		return nil, err
+		return nil, prefix, err
 	}
 	if !bytes.Equal(magic, FCC) {
-		return nil, fmt.Errorf("expected magic %s (found: %s)", FCC, magic)
+		return nil, prefix, fmt.Errorf("expected magic %s (found: %s)", FCC, magic)
 	}
 	if _, err := r.Seek(12, io.SeekCurrent); err != nil {
-		return nil, err
+		return nil, prefix, err
 	}
-	return r, err
+
+	if ix := strings.LastIndex(f, "_"); ix >= 0 {
+		prefix = f[:ix]
+	}
+	return r, prefix, err
 }
