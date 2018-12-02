@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 var FCC = []byte("MMA ")
@@ -24,6 +25,8 @@ const (
 	FileFlag = 0xFFFF
 	LineSize = 64
 )
+
+const null byte = 0x00
 
 const (
 	Program   = "mvis2list"
@@ -164,10 +167,10 @@ func listBlocks(r io.Reader, list bool) error {
 			size += n
 			count++
 		}
-		s := binary.BigEndian.Uint16(body[2:])
+		s := binary.BigEndian.Uint16(body)
 		if s == FileFlag {
-			size := binary.BigEndian.Uint32(body[4:])
-			name := string(bytes.Trim(body[8:], "\x00"))
+			size := binary.BigEndian.Uint32(body[2:])
+			name := string(bytes.Trim(body[6:], "\x00"))
 			if list {
 				fmt.Printf("%s (%d bytes)\n", name, size)
 			}
@@ -178,26 +181,18 @@ func listBlocks(r io.Reader, list bool) error {
 		}
 		prev = s
 		if list {
-			fmt.Printf("%5d (%04x): %x\n", s, body[2:4], body[4:])
+			fmt.Printf("%5d (%04x): %x\n", s, body[:2], body[2:])
 		}
 	}
 	fmt.Printf("%d blocks (%d missing), %dKB\n", count, missing, size>>10)
 	return nil
 }
 
-type block struct {
-	XMLName xml.Name `xml:"block"`
-	Counter int      `xml:"sequence,attr"`
-	Sum     string   `xml:"md5,attr"`
-}
-
 type mvis struct {
 	Name    string
 	Size    int
-	Blocks  map[int]*block
+	Written int
 	Payload []byte
-
-	offset int
 }
 
 func (m mvis) WriteFile(dir string) error {
@@ -219,35 +214,25 @@ func (m mvis) WriteMetadata(dir string) error {
 	if err := os.MkdirAll(filepath.Dir(file), 0755); err != nil && !os.IsExist(err) {
 		return nil
 	}
-	bs := struct {
-		Blocks  []block
-		Written int `xml:"blocks-written,attr"`
-		Missing int `xml:"blocks-missing,attr"`
-	}{
-		Blocks:  make([]block, len(m.Blocks)),
-		Written: len(m.Blocks),
-		Missing: (m.Size / (LineSize - 2)) - len(m.Blocks),
-	}
-	for i, b := range m.Blocks {
-		bs.Blocks[i] = *b
-	}
 	c := struct {
-		XMLName xml.Name    `xml:"mvis"`
-		Program string      `xml:"program,attr"`
-		Version string      `xml:"version,attr"`
-		Build   string      `xml:"build,attr"`
-		File    string      `xml:"filename"`
-		Sum     string      `xml:"md5"`
-		Size    int         `xml:"size"`
-		Blocks  interface{} `xml:"blocks"`
+		XMLName xml.Name  `xml:"mvis"`
+		When    time.Time `xml:"time"`
+		Program string    `xml:"program,attr"`
+		Version string    `xml:"version,attr"`
+		Build   string    `xml:"build,attr"`
+		File    string    `xml:"filename"`
+		Sum     string    `xml:"md5"`
+		Size    int       `xml:"size"`
+		Written int       `xml:"blocks"`
 	}{
 		Program: Program,
 		Version: Version,
 		Build:   BuildTime,
+		When:    time.Now(),
 		File:    m.Name,
 		Size:    m.Size,
 		Sum:     fmt.Sprintf("%x", md5.Sum(m.Payload)),
-		Blocks:  bs,
+		Written: m.Written,
 	}
 	w, err := os.Create(file)
 	if err != nil {
@@ -264,56 +249,49 @@ func (m mvis) WriteMetadata(dir string) error {
 	return w.Close()
 }
 
-func (m mvis) writeBlock(bs []byte) {
-	k := int(binary.BigEndian.Uint16(bs))
-	if m.offset == -1 {
-		m.offset = k
-	}
-	s := binary.BigEndian.Uint16(bs[2:])
-	// i := ((k-m.offset) * 32<<10) + (int(s) * (LineSize - 2))
-	i := (int(s) * (LineSize - 2))
-	copy(m.Payload[i:], bs[4:])
+func (m *mvis) writeBlock(bs []byte) {
+	s := binary.BigEndian.Uint16(bs)
+	i := int(s) * (LineSize - 2)
+	copy(m.Payload[i:], bs[2:])
 
-	log.Printf("bck: %6d, k: %2d, ix: %8d,  %x", s, k, i, bs[4:])
-
-	m.Blocks[int(s)] = &block{
-		Counter: int(s),
-		Sum:     fmt.Sprintf("%x", md5.Sum(bs)),
-	}
+	m.Written++
 }
 
 func prepare(r io.Reader, filler byte) (map[string]*mvis, error) {
 	buffer := make(map[string]*mvis)
 	var name string
 	for {
-		body := make([]byte, LineSize+2)
+		body := make([]byte, LineSize)
 		if _, err := io.ReadFull(r, body); err != nil {
 			if err == io.EOF {
 				break
 			}
 			return nil, err
 		}
-		sequence := binary.BigEndian.Uint16(body[2:])
+		sequence := binary.BigEndian.Uint16(body)
 		if sequence == FileFlag {
-			size := binary.BigEndian.Uint32(body[4:])
-			name = string(bytes.Trim(body[8:], "\x00"))
+			size := binary.BigEndian.Uint32(body[2:])
+			name = string(bytes.Trim(body[6:], "\x00"))
 			log.Printf("%d: %s", size, name)
 
 			if _, ok := buffer[name]; !ok {
 				m := mvis{
 					Name:    name,
 					Size:    int(size),
-					Blocks:  make(map[int]*block),
 					Payload: make([]byte, int(size)),
-					offset:  -1,
 				}
-				for i := 0; i < int(size); i++ {
-					m.Payload[i] = filler
+				if filler != null {
+					for i := 0; i < int(size); i++ {
+						m.Payload[i] = filler
+					}
 				}
 				buffer[name] = &m
 			}
 		} else {
-			m := buffer[name]
+			m, ok := buffer[name]
+			if !ok {
+				continue
+			}
 			m.writeBlock(body)
 		}
 	}
@@ -321,10 +299,9 @@ func prepare(r io.Reader, filler byte) (map[string]*mvis, error) {
 }
 
 type fileReader struct {
-	prefix  string
-	counter uint16
-	ps      []string
-	file    *os.File
+	prefix string
+	ps     []string
+	file   *os.File
 }
 
 func NewReader(ps []string, keep bool) (*fileReader, error) {
@@ -360,30 +337,19 @@ func (f *fileReader) Read(bs []byte) (int, error) {
 	if len(f.ps) == 0 && f.file == nil {
 		return 0, io.EOF
 	}
-	xs := make([]byte, LineSize+2)
-	binary.BigEndian.PutUint16(xs, f.counter)
 
-	n, err := f.file.Read(xs[2:])
-	if p := binary.BigEndian.Uint16(xs[2:]); err == nil && p == MilFlag {
+	n, err := f.file.Read(bs)
+	if p := binary.BigEndian.Uint16(bs); err == nil && p == MilFlag {
 		return 0, nil
-	}
-	if err == nil && n > 0 {
-		n = copy(bs, xs)
 	}
 	if err == io.EOF {
 		if len(f.ps) > 0 {
-			var prefix string
-
 			f.file.Close()
-			f.file, prefix, err = openFile(f.ps[0])
+			f.file, _, err = openFile(f.ps[0])
 			if len(f.ps) == 1 {
 				f.ps = f.ps[:0]
 			} else {
 				f.ps = f.ps[1:]
-			}
-			if prefix != f.prefix {
-				f.prefix = prefix
-				f.counter++
 			}
 			return 0, nil
 		} else {
