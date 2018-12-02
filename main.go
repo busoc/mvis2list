@@ -191,11 +191,12 @@ func listBlocks(r io.Reader, list bool) error {
 type mvis struct {
 	Name    string
 	Size    int
-	Written int
+	Blocks  int
+	Bytes   int
 	Payload []byte
 }
 
-func (m mvis) WriteFile(dir string) error {
+func (m *mvis) WriteFile(dir string) error {
 	if len(m.Payload) == 0 {
 		return nil
 	}
@@ -206,7 +207,7 @@ func (m mvis) WriteFile(dir string) error {
 	return ioutil.WriteFile(file, m.Payload, 0644)
 }
 
-func (m mvis) WriteMetadata(dir string) error {
+func (m *mvis) WriteMetadata(dir string) error {
 	if len(m.Payload) == 0 {
 		return nil
 	}
@@ -223,7 +224,8 @@ func (m mvis) WriteMetadata(dir string) error {
 		File    string    `xml:"filename"`
 		Sum     string    `xml:"md5"`
 		Size    int       `xml:"size"`
-		Written int       `xml:"blocks"`
+		Blocks  int       `xml:"blocks"`
+		Bytes   int       `xml:"bytes"`
 	}{
 		Program: Program,
 		Version: Version,
@@ -232,7 +234,8 @@ func (m mvis) WriteMetadata(dir string) error {
 		File:    m.Name,
 		Size:    m.Size,
 		Sum:     fmt.Sprintf("%x", md5.Sum(m.Payload)),
-		Written: m.Written,
+		Blocks:  m.Blocks,
+		Bytes:   m.Bytes,
 	}
 	w, err := os.Create(file)
 	if err != nil {
@@ -249,12 +252,19 @@ func (m mvis) WriteMetadata(dir string) error {
 	return w.Close()
 }
 
+const blockSize = (LineSize - 2) * 32 << 10
+
 func (m *mvis) writeBlock(bs []byte) {
 	s := binary.BigEndian.Uint16(bs)
 	i := int(s) * (LineSize - 2)
-	copy(m.Payload[i:], bs[2:])
+	if m.Bytes > 0 {
+		i += ((m.Bytes / blockSize) * blockSize)
+	}
 
-	m.Written++
+	n := copy(m.Payload[i:], bs[2:])
+
+	m.Blocks++
+	m.Bytes += n
 }
 
 func prepare(r io.Reader, filler byte) (map[string]*mvis, error) {
@@ -346,6 +356,10 @@ func (f *fileReader) Read(bs []byte) (int, error) {
 		if len(f.ps) > 0 {
 			f.file.Close()
 			f.file, _, err = openFile(f.ps[0])
+			if err != nil {
+				return 0, err
+			}
+			log.Println("==>", f.file.Name())
 			if len(f.ps) == 1 {
 				f.ps = f.ps[:0]
 			} else {
