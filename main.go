@@ -21,9 +21,10 @@ import (
 var FCC = []byte("MMA ")
 
 const (
-	MilFlag  = 0xFFFE
-	FileFlag = 0xFFFF
-	LineSize = 64
+	MilFlag   = 0xFFFE
+	FileFlag  = 0xFFFF
+	LineSize  = 64
+	blockSize = (LineSize - 2) * (32 << 10)
 )
 
 const null byte = 0x00
@@ -31,7 +32,7 @@ const null byte = 0x00
 const (
 	Program   = "mvis2list"
 	Version   = "0.1.0"
-	BuildTime = "2018-11-29 20:45:00"
+	BuildTime = "2018-12-03 07:50:00"
 )
 
 const helpText = `mvis2list transforms MVIS data from hadock archive to MVIS
@@ -252,8 +253,6 @@ func (m *mvis) WriteMetadata(dir string) error {
 	return w.Close()
 }
 
-const blockSize = (LineSize - 2) * 32 << 10
-
 func (m *mvis) writeBlock(bs []byte) {
 	s := binary.BigEndian.Uint16(bs)
 	i := int(s) * (LineSize - 2)
@@ -282,7 +281,6 @@ func prepare(r io.Reader, filler byte) (map[string]*mvis, error) {
 		if sequence == FileFlag {
 			size := binary.BigEndian.Uint32(body[2:])
 			name = string(bytes.Trim(body[6:], "\x00"))
-			log.Printf("%d: %s", size, name)
 
 			if _, ok := buffer[name]; !ok {
 				m := mvis{
@@ -309,7 +307,6 @@ func prepare(r io.Reader, filler byte) (map[string]*mvis, error) {
 }
 
 type fileReader struct {
-	prefix string
 	ps     []string
 	file   *os.File
 }
@@ -317,16 +314,27 @@ type fileReader struct {
 func NewReader(ps []string, keep bool) (*fileReader, error) {
 	sort.Strings(ps)
 	var xs []string
-	for _, p := range ps {
+	for i := 0; i < len(ps); i++ {
+		p := ps[i]
 		if !keep && strings.HasSuffix(p, ".bad") {
 			continue
 		}
-		xs = append(xs, p)
+		for j := i+1; j < len(ps); j++ {
+			f := ps[j]
+			ix := strings.LastIndex(f, "_")
+			if ix < 0 {
+				return nil, fmt.Errorf("invalid filename")
+			}
+			if !strings.HasPrefix(p, f[:ix]) {
+				xs, i = append(xs, ps[j-1]), j-1
+				break
+			}
+		}
 	}
 	if len(xs) == 0 {
 		return nil, fmt.Errorf("no valid files provided")
 	}
-	f, prefix, err := openFile(xs[0])
+	f, err := openFile(xs[0])
 	if err != nil {
 		return nil, err
 	}
@@ -336,7 +344,7 @@ func NewReader(ps []string, keep bool) (*fileReader, error) {
 		xs = xs[:0]
 	}
 
-	return &fileReader{file: f, ps: xs, prefix: prefix}, nil
+	return &fileReader{file: f, ps: xs}, nil
 }
 
 func (f *fileReader) Filename() string {
@@ -355,11 +363,10 @@ func (f *fileReader) Read(bs []byte) (int, error) {
 	if err == io.EOF {
 		if len(f.ps) > 0 {
 			f.file.Close()
-			f.file, _, err = openFile(f.ps[0])
+			f.file, err = openFile(f.ps[0])
 			if err != nil {
 				return 0, err
 			}
-			log.Println("==>", f.file.Name())
 			if len(f.ps) == 1 {
 				f.ps = f.ps[:0]
 			} else {
@@ -373,26 +380,20 @@ func (f *fileReader) Read(bs []byte) (int, error) {
 	return n, err
 }
 
-func openFile(f string) (*os.File, string, error) {
-	var prefix string
-
+func openFile(f string) (*os.File, error) {
 	r, err := os.Open(f)
 	if err != nil {
-		return nil, prefix, err
+		return nil, err
 	}
 	magic := make([]byte, 4)
 	if _, err := r.Read(magic); err != nil {
-		return nil, prefix, err
+		return nil, err
 	}
 	if !bytes.Equal(magic, FCC) {
-		return nil, prefix, fmt.Errorf("expected magic %s (found: %s)", FCC, magic)
+		return nil, fmt.Errorf("expected magic %s (found: %s)", FCC, magic)
 	}
 	if _, err := r.Seek(12, io.SeekCurrent); err != nil {
-		return nil, prefix, err
+		return nil, err
 	}
-
-	if ix := strings.LastIndex(f, "_"); ix >= 0 {
-		prefix = f[:ix]
-	}
-	return r, prefix, err
+	return r, err
 }
