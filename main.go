@@ -27,6 +27,11 @@ const (
 	blockSize = (LineSize - 2) * (32 << 10)
 )
 
+const (
+	counterLimit = 32 << 10
+	counterMask  = counterLimit - 1
+)
+
 const null byte = 0x00
 
 const (
@@ -157,8 +162,8 @@ func listBlocks(r io.Reader, list bool) error {
 		count   int
 		size    int
 	)
+	body := make([]byte, LineSize)
 	for {
-		body := make([]byte, LineSize)
 		if n, err := io.ReadFull(r, body); err != nil {
 			if err == io.EOF {
 				break
@@ -175,10 +180,12 @@ func listBlocks(r io.Reader, list bool) error {
 			if list {
 				fmt.Printf("%s (%d bytes)\n", name, size)
 			}
+			count--
 			continue
 		}
-		if diff := (s - prev) - 1; diff != s && diff > 1 && diff < 32<<10 {
-			missing += int(diff)
+		if diff := (s - prev) & counterMask; diff != s && diff > 1 {
+			log.Printf("missing blocks: %d (%d - %d)", diff-1, prev, s)
+			missing += int(diff - 1)
 		}
 		prev = s
 		if list {
@@ -195,6 +202,9 @@ type mvis struct {
 	Blocks  int
 	Bytes   int
 	Payload []byte
+
+	last   uint16
+	offset int
 }
 
 func (m *mvis) WriteFile(dir string) error {
@@ -253,17 +263,27 @@ func (m *mvis) WriteMetadata(dir string) error {
 	return w.Close()
 }
 
-func (m *mvis) writeBlock(bs []byte) {
-	s := binary.BigEndian.Uint16(bs)
-	i := int(s) * (LineSize - 2)
-	if m.Bytes > 0 {
-		i += ((m.Bytes / blockSize) * blockSize)
-	}
+const blockRow = "%9d blocks (%d), offset: %9d (size: %9d, sequence: %5d), %9d written"
 
-	n := copy(m.Payload[i:], bs[2:])
+func (m *mvis) writeBlock(bs []byte) error {
+	s := binary.BigEndian.Uint16(bs)
+	if s >= counterLimit {
+		return fmt.Errorf("invalid sequence counter (%d)", s)
+	}
+	if s == m.last {
+		return nil
+	}
+	if diff := (s - m.last) & counterMask; s != diff && diff > 1 {
+		m.offset += int(diff-1) * (LineSize - 2)
+	}
+	m.last = s
+	n := copy(m.Payload[m.offset:], bs[2:])
 
 	m.Blocks++
 	m.Bytes += n
+	m.offset += n
+
+	return nil
 }
 
 func prepare(r io.Reader, filler byte) (map[string]*mvis, error) {
@@ -282,6 +302,7 @@ func prepare(r io.Reader, filler byte) (map[string]*mvis, error) {
 			size := binary.BigEndian.Uint32(body[2:])
 			name = string(bytes.Trim(body[6:], "\x00"))
 
+			log.Printf("==> %s (%d, %d)", name, size, size/(LineSize-2))
 			if _, ok := buffer[name]; !ok {
 				m := mvis{
 					Name:    name,
@@ -300,15 +321,17 @@ func prepare(r io.Reader, filler byte) (map[string]*mvis, error) {
 			if !ok {
 				continue
 			}
-			m.writeBlock(body)
+			if err := m.writeBlock(body); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return buffer, nil
 }
 
 type fileReader struct {
-	ps     []string
-	file   *os.File
+	ps   []string
+	file *os.File
 }
 
 func NewReader(ps []string, keep bool) (*fileReader, error) {
@@ -319,7 +342,7 @@ func NewReader(ps []string, keep bool) (*fileReader, error) {
 		if !keep && strings.HasSuffix(p, ".bad") {
 			continue
 		}
-		for j := i+1; j < len(ps); j++ {
+		for j := i + 1; j < len(ps); j++ {
 			f := ps[j]
 			ix := strings.LastIndex(f, "_")
 			if ix < 0 {
