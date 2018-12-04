@@ -8,8 +8,8 @@ import (
 	"encoding/xml"
 	"flag"
 	"fmt"
+	"hash"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
@@ -125,36 +125,6 @@ func main() {
 	}
 }
 
-func dumpFiles(r *fileReader, datadir string, zero, meta bool) error {
-	var filler byte
-	if !zero {
-		filler = byte(0x20)
-	}
-	buffer, err := prepare(r, filler)
-	if err != nil {
-		return err
-	}
-	if datadir == "-" {
-		for _, m := range buffer {
-			if _, err := io.Copy(os.Stdout, bytes.NewReader(m.Payload)); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	for _, m := range buffer {
-		if err := m.WriteFile(datadir); err != nil {
-			return err
-		}
-		if meta {
-			if err := m.WriteMetadata(datadir); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
 func listBlocks(r io.Reader, list bool) error {
 	var (
 		prev    uint16
@@ -196,36 +166,92 @@ func listBlocks(r io.Reader, list bool) error {
 	return nil
 }
 
+func dumpFiles(r *fileReader, datadir string, zero, meta bool) error {
+	var (
+		curr *mvis
+		err  error
+	)
+	for {
+		body := make([]byte, LineSize)
+		if _, err := io.ReadFull(r, body); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+		sequence := binary.BigEndian.Uint16(body)
+		if sequence == FileFlag {
+			if curr != nil {
+				curr.Close()
+				if meta {
+					if err := curr.WriteMetadata(); err != nil {
+						return err
+					}
+				}
+			}
+			size := binary.BigEndian.Uint32(body[2:])
+			name := string(bytes.Trim(body[6:], "\x00"))
+
+			log.Printf("==> %s (%d bytes, %d blocks)", name, size, size/(LineSize-2))
+			if curr, err = New(filepath.Join(datadir, name), int(size)); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, err := curr.Write(body); err != nil {
+			return err
+		}
+	}
+	if curr != nil {
+		curr.Close()
+		if meta {
+			if err := curr.WriteMetadata(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 type mvis struct {
+	file    *os.File
+	writer  io.Writer
+	digest  hash.Hash
+
 	Name    string
 	Size    int
 	Blocks  int
 	Bytes   int
-	Payload []byte
 
 	last   uint16
 	offset int
 }
 
-func (m *mvis) WriteFile(dir string) error {
-	if len(m.Payload) == 0 {
-		return nil
+func New(n string, s int) (*mvis, error) {
+	if err := os.MkdirAll(filepath.Dir(n), 0755); err != nil && !os.IsExist(err) {
+		return nil, err
 	}
-	file := filepath.Join(dir, m.Name)
-	if err := os.MkdirAll(filepath.Dir(file), 0755); err != nil && !os.IsExist(err) {
-		return nil
+	w, err := os.Create(n)
+	if err != nil {
+		return nil, err
 	}
-	return ioutil.WriteFile(file, m.Payload, 0644)
+	if err := w.Truncate(int64(s)); err != nil {
+		return nil, err
+	}
+	digest := md5.New()
+	m := mvis{
+		Name: n,
+		Size: s,
+		file: w,
+		digest: digest,
+		writer: io.MultiWriter(w, digest),
+	}
+	return &m, nil
 }
 
-func (m *mvis) WriteMetadata(dir string) error {
-	if len(m.Payload) == 0 {
-		return nil
-	}
-	file := filepath.Join(dir, m.Name+".xml")
-	if err := os.MkdirAll(filepath.Dir(file), 0755); err != nil && !os.IsExist(err) {
-		return nil
-	}
+func (m *mvis) WriteMetadata() error {
+	file := filepath.Join(m.Name+".xml")
+
 	c := struct {
 		XMLName xml.Name  `xml:"mvis"`
 		When    time.Time `xml:"time"`
@@ -244,7 +270,7 @@ func (m *mvis) WriteMetadata(dir string) error {
 		When:    time.Now(),
 		File:    m.Name,
 		Size:    m.Size,
-		Sum:     fmt.Sprintf("%x", md5.Sum(m.Payload)),
+		Sum:     fmt.Sprintf("%x", m.digest.Sum(nil)),
 		Blocks:  m.Blocks,
 		Bytes:   m.Bytes,
 	}
@@ -263,72 +289,39 @@ func (m *mvis) WriteMetadata(dir string) error {
 	return w.Close()
 }
 
-const blockRow = "%9d blocks (%d), offset: %9d (size: %9d, sequence: %5d), %9d written"
+func (m *mvis) Close() error {
+	return m.file.Close()
+}
 
-func (m *mvis) writeBlock(bs []byte) error {
+func (m *mvis) Write(bs []byte) (int, error) {
 	s := binary.BigEndian.Uint16(bs)
 	if s >= counterLimit {
-		return fmt.Errorf("invalid sequence counter (%d)", s)
+		return 0, fmt.Errorf("invalid sequence counter (%d)", s)
 	}
 	if s == m.last {
-		return nil
+		return 0, nil
 	}
 	if diff := (s - m.last) & counterMask; s != diff && diff > 1 {
-		// m.offset += int(diff-1) * (LineSize - 2)
+		offset := int(diff-1) * (LineSize - 2)
+		if err := m.file.Truncate(int64(offset)); err != nil {
+			return 0, nil
+		}
+		if _, err := m.file.Seek(int64(offset), io.SeekCurrent); err != nil {
+			return 0, err
+		}
 	}
 	m.last = s
 	// n := copy(m.Payload[m.offset:], bs[2:])
-	n := copy(m.Payload[m.offset:], bytes.TrimRight(bs[2:], "\x00"))
-
-	m.Blocks++
-	m.Bytes += n
-	// m.offset += n
-	m.offset += len(bs)-2
-
-	return nil
-}
-
-func prepare(r io.Reader, filler byte) (map[string]*mvis, error) {
-	buffer := make(map[string]*mvis)
-	var name string
-	for {
-		body := make([]byte, LineSize)
-		if _, err := io.ReadFull(r, body); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, err
-		}
-		sequence := binary.BigEndian.Uint16(body)
-		if sequence == FileFlag {
-			size := binary.BigEndian.Uint32(body[2:])
-			name = string(bytes.Trim(body[6:], "\x00"))
-
-			log.Printf("==> %s (%d bytes, %d blocks)", name, size, size/(LineSize-2))
-			if _, ok := buffer[name]; !ok {
-				m := mvis{
-					Name:    name,
-					Size:    int(size),
-					Payload: make([]byte, int(size)),
-				}
-				if filler != null {
-					for i := 0; i < int(size); i++ {
-						m.Payload[i] = filler
-					}
-				}
-				buffer[name] = &m
-			}
-		} else {
-			m, ok := buffer[name]
-			if !ok {
-				continue
-			}
-			if err := m.writeBlock(body); err != nil {
-				return nil, err
-			}
-		}
+	// n := copy(m.Payload[m.offset:], bytes.TrimRight(bs[2:], "\x00"))
+	if n, err := m.writer.Write(bytes.TrimRight(bs[2:], "\x00")); err == nil {
+		m.Blocks++
+		m.Bytes += n
+		return len(bs), err
+	} else {
+		return 0, err
 	}
-	return buffer, nil
+	// m.offset += n
+	// m.offset += len(bs)-2
 }
 
 type fileReader struct {
