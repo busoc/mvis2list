@@ -203,6 +203,7 @@ type mvis struct {
 	Bytes   int
 	Payload []byte
 
+	prev   uint16
 	last   uint16
 	offset int
 }
@@ -263,8 +264,6 @@ func (m *mvis) WriteMetadata(dir string) error {
 	return w.Close()
 }
 
-const blockRow = "%9d blocks (%d), offset: %9d (size: %9d, sequence: %5d), %9d written"
-
 func (m *mvis) writeBlock(bs []byte) error {
 	s := binary.BigEndian.Uint16(bs)
 	if s >= counterLimit {
@@ -274,15 +273,20 @@ func (m *mvis) writeBlock(bs []byte) error {
 		return nil
 	}
 	if diff := (s - m.last) & counterMask; s != diff && diff > 1 {
+		if diff := (s - m.prev) & counterMask; s != diff && diff == 1 {
+			m.offset -= LineSize-2
+			m.Blocks--
+			m.Bytes -= LineSize-2
+		}
 		// m.offset += int(diff-1) * (LineSize - 2)
 	}
-	m.last = s
+	m.last, m.prev = s, m.last
 	// n := copy(m.Payload[m.offset:], bs[2:])
-	n := copy(m.Payload[m.offset:], bytes.TrimRight(bs[2:], "\x00"))
+	copy(m.Payload[m.offset:], bytes.TrimRight(bs[2:], "\x00"))
 
 	m.Blocks++
-	m.Bytes += n
 	// m.offset += n
+	m.Bytes += len(bs)-2
 	m.offset += len(bs)-2
 
 	return nil
@@ -348,7 +352,7 @@ func NewReader(ps []string, keep bool) (*fileReader, error) {
 			f := ps[j]
 			ix := strings.LastIndex(f, "_")
 			if ix < 0 {
-				return nil, fmt.Errorf("invalid filename")
+				return nil, fmt.Errorf("invalid filename: %s", f)
 			}
 			if !strings.HasPrefix(p, f[:ix]) {
 				xs, i = append(xs, ps[j-1]), j-1
