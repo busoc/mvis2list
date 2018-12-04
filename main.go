@@ -304,7 +304,7 @@ func prepare(r io.Reader, filler byte) (map[string]*mvis, error) {
 			size := binary.BigEndian.Uint32(body[2:])
 			name = string(bytes.Trim(body[6:], "\x00"))
 
-			log.Printf("==> %s (%d, %d)", name, size, size/(LineSize-2))
+			log.Printf("==> %s (%d bytes, %d blocks)", name, size, size/(LineSize-2))
 			if _, ok := buffer[name]; !ok {
 				m := mvis{
 					Name:    name,
