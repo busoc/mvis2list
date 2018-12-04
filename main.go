@@ -52,6 +52,7 @@ Options:
   -meta         create XML metadata file next to listing files
   -zero         use nul byte to fill buffer instead of 0x20
   -list         print the list of blocks
+  -batch        batch
   -report       print a report on available blocks
   -version      print version and exit
   -help         print this text and exit
@@ -69,6 +70,9 @@ $ find /var/hdk/51/2018/*dat -type f -name *dat | mvis2list -datadir /tmp -meta
 # same as previous but instead of creating listing in file, write them to stdout
 # (meaning of "-" for datadir)
 $ find /var/hdk/51/2018/23/30/*dat -type f -name *dat | mvis2list -datadir -
+
+# run with a list of UPI in a flat file
+$ mvis2list -datadir /tmp -meta -zero -batch /storage/archives/ ~/upi-285.txt
 `
 
 func init() {
@@ -93,24 +97,33 @@ func main() {
 	meta := flag.Bool("meta", false, "")
 	zero := flag.Bool("zero", false, "")
 	list := flag.Bool("list", false, "")
+	batch := flag.Bool("batch", false, "")
 	report := flag.Bool("report", false, "")
 	flag.Parse()
 	if *version {
 		fmt.Fprintf(os.Stderr, "%s-%s (%s)\n", Program, Version, BuildTime)
 		os.Exit(2)
 	}
-	ps := flag.Args()
-	if len(ps) == 0 {
-		s := bufio.NewScanner(os.Stdin)
-		for s.Scan() {
-			ps = append(ps, s.Text())
+	var (
+		r   *fileReader
+		err error
+	)
+	if *batch {
+		r, err = NewBatch(flag.Arg(0), flag.Arg(1), *keep)
+	} else {
+		ps := flag.Args()
+		if len(ps) == 0 {
+			s := bufio.NewScanner(os.Stdin)
+			for s.Scan() {
+				ps = append(ps, s.Text())
+			}
+			if err := s.Err(); err != nil {
+				log.Fatalln(err)
+			}
 		}
-		if err := s.Err(); err != nil {
-			log.Fatalln(err)
-		}
+		r, err = NewReader(ps, *keep)
 	}
 
-	r, err := NewReader(ps, *keep)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -273,11 +286,11 @@ func (m *mvis) writeBlock(bs []byte) error {
 		return nil
 	}
 	if diff := (s - m.last) & counterMask; s != diff && diff > 1 {
-		if diff := (s - m.prev) & counterMask; s != diff && diff == 1 {
-			m.offset -= LineSize-2
-			m.Blocks--
-			m.Bytes -= LineSize-2
-		}
+		// if diff := (s - m.prev) & counterMask; s != diff && diff == 1 {
+		// 	m.offset -= LineSize-2
+		// 	m.Blocks--
+		// 	m.Bytes -= LineSize-2
+		// }
 		// m.offset += int(diff-1) * (LineSize - 2)
 	}
 	m.last, m.prev = s, m.last
@@ -286,8 +299,8 @@ func (m *mvis) writeBlock(bs []byte) error {
 
 	m.Blocks++
 	// m.offset += n
-	m.Bytes += len(bs)-2
-	m.offset += len(bs)-2
+	m.Bytes += len(bs) - 2
+	m.offset += len(bs) - 2
 
 	return nil
 }
@@ -338,6 +351,32 @@ func prepare(r io.Reader, filler byte) (map[string]*mvis, error) {
 type fileReader struct {
 	ps   []string
 	file *os.File
+}
+
+func NewBatch(base, file string, keep bool) (*fileReader, error) {
+	var fs []string
+	switch r, err := os.Open(file); {
+	case err == nil:
+		defer r.Close()
+
+		var set []string
+		s := bufio.NewScanner(r)
+		for s.Scan() {
+			r := s.Text()
+			if strings.HasPrefix(r, "#") || len(r) == 0 {
+				continue
+			}
+			set = append(set, r)
+		}
+		if err := s.Err(); err != nil {
+			return nil, err
+		}
+		fs = walkFiles(base, set)
+	case err != nil && file == "":
+	default:
+		return nil, err
+	}
+	return NewReader(fs, keep)
 }
 
 func NewReader(ps []string, keep bool) (*fileReader, error) {
@@ -425,4 +464,68 @@ func openFile(f string) (*os.File, error) {
 		return nil, err
 	}
 	return r, err
+}
+
+func walkFiles(base string, set []string) []string {
+	var fs []string
+
+	queue := listFiles(base, set)
+	var p string
+	for {
+		if p == "" {
+			if f, ok := <-queue; ok {
+				p = f
+			} else {
+				return fs
+			}
+		}
+		for {
+			f, ok := <-queue
+			if !ok {
+				return fs
+			}
+			if ix := strings.LastIndex(f, "_"); ix >= 0 {
+				if strings.HasPrefix(p, f[:ix]) {
+					p = f
+					continue
+				}
+				fs = append(fs, p)
+				p = f
+				break
+			} else {
+				p = ""
+			}
+		}
+	}
+	return fs
+}
+
+func listFiles(base string, set []string) <-chan string {
+	q := make(chan string)
+	go func() {
+		defer close(q)
+		filepath.Walk(base, func(p string, i os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if i.IsDir() {
+				return nil
+			}
+			if filepath.Ext(p) == ".bad" {
+				return nil
+			}
+			if len(set) == 0 {
+				q <- p
+				return nil
+			}
+			for _, s := range set {
+				if ix := strings.Index(filepath.Base(p), s); ix >= 0 {
+					q <- p
+					break
+				}
+			}
+			return nil
+		})
+	}()
+	return q
 }
