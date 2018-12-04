@@ -241,9 +241,9 @@ func New(n string, s int) (*mvis, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := w.Truncate(int64(s)); err != nil {
-		return nil, err
-	}
+	// if err := w.Truncate(int64(s)); err != nil {
+	// 	return nil, err
+	// }
 	digest := md5.New()
 	m := mvis{
 		Name: n,
