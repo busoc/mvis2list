@@ -50,7 +50,6 @@ Options:
   -datadir DIR  base directory where listing files will be written
   -keep         keep content of bad files when creating listing
   -meta         create XML metadata file next to listing files
-  -zero         use nul byte to fill buffer instead of 0x20
   -list         print the list of blocks
   -batch        batch
   -report       print a report on available blocks
@@ -83,19 +82,11 @@ func init() {
 	}
 }
 
-type coze struct {
-	Size    int
-	Count   int
-	Missing int
-	Name    string
-}
-
 func main() {
 	datadir := flag.String("datadir", "-", "")
 	version := flag.Bool("version", false, "")
 	keep := flag.Bool("keep", false, "")
 	meta := flag.Bool("meta", false, "")
-	zero := flag.Bool("zero", false, "")
 	list := flag.Bool("list", false, "")
 	batch := flag.Bool("batch", false, "")
 	report := flag.Bool("report", false, "")
@@ -133,7 +124,7 @@ func main() {
 		}
 		return
 	}
-	if err := dumpFiles(r, *datadir, *zero, *meta); err != nil {
+	if err := dumpFiles(r, *datadir, *meta); err != nil {
 		log.Fatalln(err)
 	}
 }
@@ -146,6 +137,7 @@ func listBlocks(r io.Reader, list bool) error {
 		size    int
 	)
 	body := make([]byte, LineSize)
+	var name string
 	for {
 		if n, err := io.ReadFull(r, body); err != nil {
 			if err == io.EOF {
@@ -159,7 +151,7 @@ func listBlocks(r io.Reader, list bool) error {
 		s := binary.BigEndian.Uint16(body)
 		if s == FileFlag {
 			size := binary.BigEndian.Uint32(body[2:])
-			name := string(bytes.Trim(body[6:], "\x00"))
+			name = string(bytes.Trim(body[6:], "\x00"))
 			if list {
 				fmt.Printf("%s (%d bytes)\n", name, size)
 			}
@@ -167,7 +159,7 @@ func listBlocks(r io.Reader, list bool) error {
 			continue
 		}
 		if diff := (s - prev) & counterMask; diff != s && diff > 1 {
-			log.Printf("missing blocks: %d (%d - %d)", diff-1, prev, s)
+			log.Printf("missing blocks (%s): %d (%d - %d)", name, diff-1, prev, s)
 			missing += int(diff - 1)
 		}
 		prev = s
@@ -179,7 +171,7 @@ func listBlocks(r io.Reader, list bool) error {
 	return nil
 }
 
-func dumpFiles(r *fileReader, datadir string, zero, meta bool) error {
+func dumpFiles(r *fileReader, datadir string, meta bool) error {
 	var (
 		curr *mvis
 		err  error
@@ -303,8 +295,10 @@ func (m *mvis) WriteMetadata() error {
 	return w.Close()
 }
 
-<<<<<<< HEAD
 func (m *mvis) Close() error {
+	// if err := m.file.Truncate(int64(m.Bytes)); err != nil {
+	// 	return err
+	// }
 	return m.file.Close()
 }
 
@@ -326,7 +320,7 @@ func (m *mvis) Write(bs []byte) (int, error) {
 	}
 	m.last, m.prev = s, m.last
 	// n := copy(m.Payload[m.offset:], bs[2:])
-	if n, err := m.writer.Write(bytes.TrimRight(bs[2:], "\x00")); err == nil {
+	if _, err := m.writer.Write(bytes.TrimRight(bs[2:], "\x00")); err == nil {
 		m.Blocks++
 		m.Bytes += len(bs)-2
 		return len(bs), err
