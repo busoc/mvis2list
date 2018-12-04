@@ -274,14 +274,16 @@ func (m *mvis) writeBlock(bs []byte) error {
 		return nil
 	}
 	if diff := (s - m.last) & counterMask; s != diff && diff > 1 {
-		m.offset += int(diff-1) * (LineSize - 2)
+		// m.offset += int(diff-1) * (LineSize - 2)
 	}
 	m.last = s
-	n := copy(m.Payload[m.offset:], bs[2:])
+	// n := copy(m.Payload[m.offset:], bs[2:])
+	n := copy(m.Payload[m.offset:], bytes.TrimRight(bs[2:], "\x00"))
 
 	m.Blocks++
 	m.Bytes += n
-	m.offset += n
+	// m.offset += n
+	m.offset += len(bs)-2
 
 	return nil
 }
