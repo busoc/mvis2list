@@ -203,8 +203,13 @@ func dumpFiles(r *fileReader, datadir string, meta bool) error {
 			}
 			continue
 		}
+		if curr == nil {
+			continue
+		}
 		if _, err := curr.Write(body); err != nil {
-			return err
+			log.Printf("error when writing %s: %s", curr.Name, err)
+			curr.Close()
+			curr = nil
 		}
 	}
 	if curr != nil {
@@ -352,6 +357,9 @@ func NewBatch(base, file string, keep bool) (*fileReader, error) {
 		if err := s.Err(); err != nil {
 			return nil, err
 		}
+		if len(set) == 0 {
+			return nil, fmt.Errorf("no upi provided")
+		}
 		fs = walkFiles(base, set)
 	case err != nil && file == "":
 	default:
@@ -485,6 +493,10 @@ func listFiles(base string, set []string) <-chan string {
 	q := make(chan string)
 	go func() {
 		defer close(q)
+
+		sort.Strings(set)
+
+		var prefix string
 		filepath.Walk(base, func(p string, i os.FileInfo, err error) error {
 			if err != nil {
 				return err
@@ -495,14 +507,18 @@ func listFiles(base string, set []string) <-chan string {
 			if filepath.Ext(p) == ".bad" {
 				return nil
 			}
-			if len(set) == 0 {
-				q <- p
-				return nil
-			}
+      if len(set) == 0 || (len(prefix) > 0 && strings.Contains(p, prefix)) {
+        q <- p
+        return nil
+      }
+			base := filepath.Base(p)
 			for _, s := range set {
-				if ix := strings.Index(filepath.Base(p), s); ix >= 0 {
+				if strings.HasPrefix(base[5:], s) {
 					q <- p
+					prefix = s
 					break
+				} else {
+					prefix = ""
 				}
 			}
 			return nil
