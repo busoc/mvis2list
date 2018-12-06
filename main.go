@@ -52,6 +52,7 @@ Options:
   -meta         create XML metadata file next to listing files
   -list         print the list of blocks
   -batch        batch
+  -text         stripped null bytes from blocks before writing
   -report       print a report on available blocks
   -version      print version and exit
   -help         print this text and exit
@@ -88,6 +89,7 @@ func main() {
 	keep := flag.Bool("keep", false, "")
 	meta := flag.Bool("meta", false, "")
 	list := flag.Bool("list", false, "")
+	text := flag.Bool("text", false, "")
 	batch := flag.Bool("batch", false, "")
 	report := flag.Bool("report", false, "")
 	flag.Parse()
@@ -124,7 +126,7 @@ func main() {
 		}
 		return
 	}
-	if err := dumpFiles(r, *datadir, *meta); err != nil {
+	if err := dumpFiles(r, *datadir, *meta, *text); err != nil {
 		log.Fatalln(err)
 	}
 }
@@ -171,7 +173,7 @@ func listBlocks(r io.Reader, list bool) error {
 	return nil
 }
 
-func dumpFiles(r *fileReader, datadir string, meta bool) error {
+func dumpFiles(r *fileReader, datadir string, meta, text bool) error {
 	var (
 		curr *mvis
 		err  error
@@ -197,8 +199,12 @@ func dumpFiles(r *fileReader, datadir string, meta bool) error {
 			size := binary.BigEndian.Uint32(body[2:])
 			name := string(bytes.Trim(body[6:], "\x00"))
 
-			log.Printf("==> %s (%d bytes, %d blocks)", name, size, size/(LineSize-2))
-			if curr, err = New(filepath.Join(datadir, name), int(size)); err != nil {
+			kind := "binary"
+			if text {
+				kind = "text"
+			}
+			log.Printf("==> %s (%s file, %d bytes, %d blocks)", name, kind, size, size/(LineSize-2))
+			if curr, err = New(filepath.Join(datadir, name), int(size), text); err != nil {
 				return err
 			}
 			continue
@@ -232,13 +238,14 @@ type mvis struct {
 	Size    int
 	Blocks  int
 	Bytes   int
+	text    bool
 
 	prev   uint16
 	last   uint16
 	offset int
 }
 
-func New(n string, s int) (*mvis, error) {
+func New(n string, s int, txt bool) (*mvis, error) {
 	if err := os.MkdirAll(filepath.Dir(n), 0755); err != nil && !os.IsExist(err) {
 		return nil, err
 	}
@@ -256,6 +263,7 @@ func New(n string, s int) (*mvis, error) {
 		file: w,
 		digest: digest,
 		writer: io.MultiWriter(w, digest),
+		text: txt,
 	}
 	return &m, nil
 }
@@ -325,7 +333,12 @@ func (m *mvis) Write(bs []byte) (int, error) {
 	}
 	m.last, m.prev = s, m.last
 	// n := copy(m.Payload[m.offset:], bs[2:])
-	if _, err := m.writer.Write(bytes.TrimRight(bs[2:], "\x00")); err == nil {
+	if m.text {
+		bs = bytes.TrimRight(bs[2:], "\x00")
+	} else {
+		bs = bs[2:]
+	}
+	if _, err := m.writer.Write(bs); err == nil {
 		m.Blocks++
 		m.Bytes += len(bs)-2
 		return len(bs), err
